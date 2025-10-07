@@ -1,25 +1,13 @@
 "use client"
 
 import type React from "react"
+import marked from "marked"
+import { ensurePdfjsWorker } from "@/lib/pdfjs-worker"
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
-
-// 3rd party libs used in the original Vite code
-import { marked } from "marked"
-import * as pdfjsLib from "pdfjs-dist"
-import * as mammoth from "mammoth"
-
-// Ensure PDF.js worker is set in the browser context
-// We do this in an effect to avoid SSR issues.
-function useSetupPdfWorker() {
-  useEffect(() => {
-    // @ts-expect-error GlobalWorkerOptions exists at runtime
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://esm.sh/pdfjs-dist@^4.4.171/build/pdf.worker.mjs"
-  }, [])
-}
 
 type ChatMessage = {
   id: string
@@ -27,46 +15,97 @@ type ChatMessage = {
   content: string // Markdown content
 }
 
-async function extractTextFromFile(file: File): Promise<string> {
-  const reader = new FileReader()
-
-  return new Promise((resolve, reject) => {
-    reader.onload = async (event) => {
-      try {
-        const buffer = event.target?.result as ArrayBuffer
-
-        // PDF
-        if (file.type === "application/pdf") {
-          const pdf = await pdfjsLib.getDocument(buffer).promise
-          let text = ""
-          for (let i = 1; i <= pdf.numPages; i++) {
-            const page = await pdf.getPage(i)
-            const content = await page.getTextContent()
-            text += (content.items as any[]).map((item) => item.str).join(" ")
-          }
-          resolve(text)
-        }
-        // DOCX
-        else if (file.name.toLowerCase().endsWith(".docx")) {
-          const result = await mammoth.extractRawText({ arrayBuffer: buffer })
-          resolve(result.value)
-        }
-        // TXT or others
-        else {
-          resolve(new TextDecoder().decode(buffer))
-        }
-      } catch (e) {
-        reject(e)
-      }
-    }
-
-    reader.onerror = (err) => reject(err)
-    reader.readAsArrayBuffer(file)
+async function getArrayBuffer(file: File): Promise<ArrayBuffer> {
+  // Use modern API when available
+  if ("arrayBuffer" in file && typeof (file as any).arrayBuffer === "function") {
+    return await (file as any).arrayBuffer()
+  }
+  // Fallback to FileReader for legacy environments
+  return await new Promise<ArrayBuffer>((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(fr.result as ArrayBuffer)
+    fr.onerror = (err) => reject(err)
+    fr.readAsArrayBuffer(file)
   })
 }
 
+async function extractTextFromFile(file: File): Promise<string> {
+  const name = (file.name || "").toLowerCase()
+  const type = file.type || ""
+
+  const isPDF = type === "application/pdf" || name.endsWith(".pdf")
+  const isDOCX =
+    type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || name.endsWith(".docx")
+  const isTXT = type === "text/plain" || name.endsWith(".txt")
+
+  try {
+    if (isPDF) {
+      const buffer = await getArrayBuffer(file)
+      const data = new Uint8Array(buffer)
+
+      // Use ESM build to match the ESM worker we configure
+      const pdfjsLib = await import("pdfjs-dist/build/pdf.mjs")
+
+      // Attempt with worker (preferred)
+      let pdf
+      try {
+        pdf = await pdfjsLib.getDocument({ data }).promise
+      } catch (err: any) {
+        const msg = String(err?.message || err || "")
+        // Fallback if the environment still reports a worker mismatch
+        if (msg.includes("does not match the Worker version")) {
+          pdf = await pdfjsLib.getDocument({ data, disableWorker: true }).promise
+        } else {
+          throw err
+        }
+      }
+
+      let text = ""
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i)
+        const content = await page.getTextContent()
+        text += (content.items as any[]).map((item) => item.str).join(" ")
+        text += "\n"
+      }
+      return text.trim()
+    }
+
+    if (isDOCX) {
+      const buffer = await getArrayBuffer(file)
+      const mammoth = await import("mammoth")
+      const result = await mammoth.extractRawText({ arrayBuffer: buffer })
+      return result.value || ""
+    }
+
+    if (isTXT) {
+      // Prefer the modern API to avoid encoding issues
+      try {
+        return await file.text()
+      } catch {
+        const buffer = await getArrayBuffer(file)
+        return new TextDecoder("utf-8", { fatal: false }).decode(buffer)
+      }
+    }
+
+    // Unknown file type: attempt a sane text fallback
+    try {
+      return await file.text()
+    } catch {
+      const buffer = await getArrayBuffer(file)
+      return new TextDecoder("utf-8", { fatal: false }).decode(buffer)
+    }
+  } catch (e) {
+    console.error("[v0] extractTextFromFile error:", e)
+    throw e
+  }
+}
+
 export default function DocChat() {
-  useSetupPdfWorker()
+  useEffect(() => {
+    ensurePdfjsWorker().catch((e) => {
+      console.log("[v0] Failed to init pdfjs worker:", e)
+    })
+  }, [])
 
   const [files, setFiles] = useState<File[]>([])
   const [knowledgeBase, setKnowledgeBase] = useState<string>("")
@@ -89,6 +128,7 @@ export default function DocChat() {
     const list = e.target.files
     if (!list) return
     setFiles(Array.from(list))
+    e.target.value = ""
   }
 
   async function handleProcessDocuments() {
@@ -182,7 +222,7 @@ export default function DocChat() {
           <Input
             id="file-upload"
             type="file"
-            accept=".pdf,.docx,.txt"
+            accept=".pdf,application/pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.txt,text/plain"
             multiple
             onChange={handleFileChange}
             aria-describedby="upload-help"
@@ -234,7 +274,7 @@ function MessageBubble(props: { role: "user" | "assistant"; content: string }) {
   const html = useMemo(() => {
     // marked can return string or Promise<string>; normalize to string
     const out = marked.parse(props.content)
-    if (out && typeof (out as any).then === "function") {
+    if (out && typeof out.then === "function") {
       // If it is async, we won't await here; as a fallback show raw text.
       return undefined as unknown as string
     }
