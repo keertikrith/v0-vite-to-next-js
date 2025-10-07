@@ -1,7 +1,7 @@
 "use client"
 
 import type React from "react"
-import marked from "marked"
+import { marked } from "marked"
 import { ensurePdfjsWorker } from "@/lib/pdfjs-worker"
 
 import { useEffect, useMemo, useRef, useState } from "react"
